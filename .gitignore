@@ -7,3 +7,4 @@ notifier-endpoint/package-lock.json
 notifier-endpoint/package.json
 .venv
 resources
+__pycache__
