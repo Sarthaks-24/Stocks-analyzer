@@ -1,0 +1,9 @@
+.env
+data
+cache
+notifier/.vercel
+notifier/nodemodules/
+notifier-endpoint/package-lock.json
+notifier-endpoint/package.json
+.venv
+resources
