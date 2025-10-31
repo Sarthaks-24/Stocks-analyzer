@@ -564,7 +564,7 @@ class OptionChainDashboard:
         except Exception as e:
             print(f"Error reading history from DB: {e}")
             messagebox.showerror("Database Error", f"Could not read graph data: {e}")
-        finally:
+        finally: 
             if conn:
                 conn.close()
 
