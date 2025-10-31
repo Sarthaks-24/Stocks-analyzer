@@ -2,50 +2,136 @@ import json
 import os
 import glob
 import tkinter as tk
-from tkinter import ttk, messagebox
-from datetime import datetime, timedelta
+from tkinter import ttk, messagebox, simpledialog
+from datetime import datetime, timedelta, time as dt_time  # <-- Make sure dt_time is imported
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.dates import DateFormatter
 import matplotlib.ticker as ticker
+from tkcalendar import DateEntry
+import threading
+import time
+import re
+import sqlite3
 
 # --- Constants ---
-DATA_DIR = "data"
+DB_FILE = "resources/live_data.db"
 RESOURCES_DIR = "resources"
-REFRESH_RATE_MS = 2000  # Refresh data every 2 seconds
-CACHE_STALE_SECONDS = 1  # How old cached data can be
+REFRESH_RATE_MS = 2000
+MARKET_CLOSE_TIME = dt_time(15, 30, 0) # 3:30 PM
 
 # --- Main Application Class ---
 class OptionChainDashboard:
     def __init__(self, root):
         self.root = root
-        self.root.title("Option Chain Dashboard")
-        self.root.geometry("2000x800") 
+        self.root.title("Option Chain Dashboard (SQLite Edition)")
+        self.root.geometry("2000x800")
 
         self.chain_file_var = tk.StringVar()
         self.chain_data = {}
         self.instrument_map = {}
-        self.live_data_cache = {}
-
+        self.current_expiry_date = None
+        self.latest_snapshot_date = None
+        
+        self.date_change_timer = None
+        self.update_in_progress = False
+        self.debug_mode = True
+        
         self.setup_gui()
         self.load_available_chains()
         self.auto_refresh_data()
+
+    def log_debug(self, message):
+        """Print debug messages."""
+        if self.debug_mode:
+            print(f"[DEBUG] {message}")
+
+    def safe_get_nested(self, data, *keys, default=None):
+        """
+        Safely navigate nested dictionary structure.
+        """
+        result = data
+        for key in keys:
+            if isinstance(result, dict):
+                result = result.get(key)
+                if result is None:
+                    return default
+            else:
+                return default
+        return result if result is not None else default
 
     def setup_gui(self):
         """Creates the main GUI layout."""
         top_frame = ttk.Frame(self.root, padding="10")
         top_frame.pack(fill=tk.X)
+        
+        # Chain selector
         ttk.Label(top_frame, text="Select Option Chain:").pack(side=tk.LEFT, padx=(0, 5))
         self.chain_dropdown = ttk.Combobox(
             top_frame, textvariable=self.chain_file_var, state="readonly", width=40
         )
         self.chain_dropdown.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.chain_dropdown.bind("<<ComboboxSelected>>", self.on_chain_select)
+        
+        # Date Range selector
+        date_frame = ttk.LabelFrame(top_frame, text="Date Range", padding="5")
+        date_frame.pack(side=tk.LEFT, padx=10, fill=tk.Y)
+
+        # Start date
+        start_frame = ttk.Frame(date_frame)
+        start_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Label(start_frame, text="From:").pack(side=tk.TOP)
+        self.start_date = DateEntry(
+            start_frame,
+            width=12,
+            background='darkblue',
+            foreground='white',
+            borderwidth=2,
+            date_pattern='yyyy-mm-dd',
+            firstweekday='sunday'
+        )
+        self.start_date.pack(side=tk.TOP, pady=2)
+        self.start_date.set_date(datetime.now().date())
+        self.start_date.bind("<<DateEntrySelected>>", self.on_date_change)
+
+        # End date
+        end_frame = ttk.Frame(date_frame)
+        end_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Label(end_frame, text="To:").pack(side=tk.TOP)
+        self.end_date = DateEntry(
+            end_frame,
+            width=12,
+            background='darkblue',
+            foreground='white',
+            borderwidth=2,
+            date_pattern='yyyy-mm-dd',
+            firstweekday='sunday'
+        )
+        self.end_date.pack(side=tk.TOP, pady=2)
+        self.end_date.set_date(datetime.now().date())
+        self.end_date.bind("<<DateEntrySelected>>", self.on_date_change)
+        
+        # Refresh button
         self.refresh_button = ttk.Button(
-            top_frame, text="Refresh Now", command=self.update_all_rows
+            top_frame, text="Refresh Now", command=self.force_refresh
         )
         self.refresh_button.pack(side=tk.LEFT, padx=10)
 
+        # --- Bottom Status Frame ---
+        bottom_frame = ttk.Frame(self.root, padding="10")
+        bottom_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        # Status label
+        self.status_label = ttk.Label(bottom_frame, text="", foreground="gray")
+        self.status_label.pack(side=tk.LEFT, padx=10)
+
+        # Debug button
+        self.debug_button = ttk.Button(
+            bottom_frame, text="Debug Info", command=self.show_debug_info
+        )
+        self.debug_button.pack(side=tk.RIGHT, padx=5)
+        
+        # --- Tree setup ---
         tree_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -79,23 +165,15 @@ class OptionChainDashboard:
 
         # Define Column properties
         col_width, greek_width = 80, 70
-        self.tree.column("call_oi_chg_pct", width=col_width, anchor=tk.E)
-        self.tree.column("call_oi", width=col_width, anchor=tk.E)
-        self.tree.column("call_ltp", width=col_width, anchor=tk.E)
-        self.tree.column("call_iv", width=greek_width, anchor=tk.E) 
-        self.tree.column("call_delta", width=greek_width, anchor=tk.E) 
-        self.tree.column("call_gamma", width=greek_width, anchor=tk.E) 
-        self.tree.column("call_vega", width=greek_width, anchor=tk.E) 
-        self.tree.column("call_theta", width=greek_width, anchor=tk.E) 
+        for col in ["call_oi_chg_pct", "call_oi", "call_ltp"]:
+            self.tree.column(col, width=col_width, anchor=tk.E)
+        for col in ["call_iv", "call_delta", "call_gamma", "call_vega", "call_theta"]:
+            self.tree.column(col, width=greek_width, anchor=tk.E)
         self.tree.column("strike", width=80, anchor=tk.CENTER)
-        self.tree.column("put_theta", width=greek_width, anchor=tk.W) 
-        self.tree.column("put_vega", width=greek_width, anchor=tk.W) 
-        self.tree.column("put_gamma", width=greek_width, anchor=tk.W) 
-        self.tree.column("put_delta", width=greek_width, anchor=tk.W) 
-        self.tree.column("put_iv", width=greek_width, anchor=tk.W) 
-        self.tree.column("put_ltp", width=col_width, anchor=tk.W)
-        self.tree.column("put_oi", width=col_width, anchor=tk.W)
-        self.tree.column("put_oi_chg_pct", width=col_width, anchor=tk.W)
+        for col in ["put_theta", "put_vega", "put_gamma", "put_delta", "put_iv"]:
+            self.tree.column(col, width=greek_width, anchor=tk.W)
+        for col in ["put_ltp", "put_oi", "put_oi_chg_pct"]:
+            self.tree.column(col, width=col_width, anchor=tk.W)
 
         style = ttk.Style()
         style.configure("Treeview", rowheight=28, font=('Helvetica', 9))
@@ -111,14 +189,44 @@ class OptionChainDashboard:
         self.tree.pack(side='left', fill='both', expand=True)
         self.tree.bind("<Button-3>", self.show_context_menu)
 
+    def show_debug_info(self):
+        """Show debug information dialog."""
+        debug_info = []
+        debug_info.append(f"Chain File: {self.chain_file_var.get()}")
+        debug_info.append(f"Selected Expiry: {self.current_expiry_date}")
+        debug_info.append(f"Date Range: {self.start_date.get_date()} to {self.end_date.get_date()}")
+        debug_info.append(f"Displaying Snapshot For: {self.latest_snapshot_date}")
+        debug_info.append(f"Total Strikes: {len(self.chain_data)}")
+        debug_info.append(f"Instrument Map Size: {len(self.instrument_map)}")
+        debug_info.append(f"Database File: {DB_FILE} (Exists: {os.path.exists(DB_FILE)})")
+        if os.path.exists(DB_FILE):
+             debug_info.append(f"Database Size: {os.path.getsize(DB_FILE) / (1024*1024):.2f} MB")
+        
+        messagebox.showinfo("Debug Information", "\n".join(debug_info))
+
+    def on_date_change(self, event=None):
+        """Debounced date change handler."""
+        if self.date_change_timer:
+            self.root.after_cancel(self.date_change_timer)
+        self.date_change_timer = self.root.after(500, self.force_refresh)
+
+    def force_refresh(self):
+        """Force refresh by clearing cache and updating."""
+        self.log_debug("Force refresh initiated")
+        self.update_all_rows()
+
     def load_available_chains(self):
+        """Load available chain files."""
         try:
             search_pattern = os.path.join(RESOURCES_DIR, "*-*-*.json")
             chain_files = [os.path.basename(f) for f in glob.glob(search_pattern)]
+            self.log_debug(f"Found {len(chain_files)} chain files")
+            
             if not chain_files:
-                messagebox.showwarning("No Chains", f"No option chain files found in '{RESOURCES_DIR}'.")
+                messagebox.showwarning("No Chains", f"No option chain files (*-*-*.json) found in '{RESOURCES_DIR}'.\nPlease run `search.py` first.")
                 return
-            self.chain_dropdown['values'] = chain_files
+            
+            self.chain_dropdown['values'] = sorted(chain_files)
             if chain_files:
                 self.chain_dropdown.set(chain_files[0])
                 self.on_chain_select()
@@ -126,13 +234,48 @@ class OptionChainDashboard:
             messagebox.showerror("Error", f"Failed to scan resources dir: {e}")
 
     def on_chain_select(self, event=None):
+        """Handle chain selection."""
         filename = self.chain_file_var.get()
         if not filename: 
             return
+        
         filepath = os.path.join(RESOURCES_DIR, filename)
+        self.log_debug(f"Loading chain file: {filepath}")
+
+        # --- DYNAMIC DATE LOGIC ---
+        self.current_expiry_date = None
+        match = re.search(r'(\d{2}-\d{2}-\d{4})\.json$', filename)
+        if match:
+            try:
+                self.current_expiry_date = datetime.strptime(match.group(1), '%d-%m-%Y').date()
+                self.log_debug(f"Parsed expiry date: {self.current_expiry_date}")
+            except ValueError as e:
+                self.log_debug(f"Could not parse date from filename: {e}")
+        
+        # Configure date pickers based on expiry
+        today = datetime.now().date()
+        if self.current_expiry_date:
+            # Set max date for calendars to the expiry date
+            self.start_date.config(maxdate=self.current_expiry_date)
+            self.end_date.config(maxdate=self.current_expiry_date)
+            
+            # Set end_date to expiry or today, whichever is earlier
+            default_end_date = min(self.current_expiry_date, today)
+            self.end_date.set_date(default_end_date)
+            self.start_date.set_date(default_end_date) # Also set start date
+        else:
+            # Reset if no valid expiry found
+            self.start_date.config(maxdate=None)
+            self.end_date.config(maxdate=None)
+            self.end_date.set_date(today)
+            self.start_date.set_date(today)
+        # --- END DYNAMIC DATE LOGIC ---
+
         try:
             with open(filepath, 'r') as f: 
                 self.chain_data = json.load(f)
+            
+            self.log_debug(f"Loaded {len(self.chain_data)} strikes from chain file")
             self.populate_tree_skeleton()
             self.update_all_rows()
         except Exception as e:
@@ -140,10 +283,11 @@ class OptionChainDashboard:
             self.chain_data, self.instrument_map = {}, {}
 
     def populate_tree_skeleton(self):
+        """Create tree structure with strikes."""
         for item in self.tree.get_children(): 
             self.tree.delete(item)
         self.instrument_map.clear()
-        self.live_data_cache.clear()
+        
         if not self.chain_data: 
             return
 
@@ -152,6 +296,8 @@ class OptionChainDashboard:
         except ValueError: 
             sorted_strikes = sorted(self.chain_data.keys())
 
+        self.log_debug(f"Populating tree with {len(sorted_strikes)} strikes")
+        
         num_placeholders = len(self.tree['columns'])
         placeholders = [""] * num_placeholders
         strike_col_index = self.tree['columns'].index('strike')
@@ -170,329 +316,297 @@ class OptionChainDashboard:
                 self.instrument_map[pe_key] = (strike, "PE", item_id)
 
     def auto_refresh_data(self):
+        """Auto-refresh timer."""
         try: 
-            self.update_all_rows()
+            # Only refresh if "To" date is today
+            if self.end_date.get_date() == datetime.now().date():
+                if not self.update_in_progress:
+                    self.update_all_rows()
         except Exception as e: 
             print(f"Refresh Error: {e}")
         finally: 
             self.root.after(REFRESH_RATE_MS, self.auto_refresh_data)
 
-    def calculate_change_pct(self, ltp, cp):
-        """Safely calculates percentage change."""
-        if cp is None or cp == 0:
-            return 0.0
-        try:
-            return ((ltp - cp) / cp) * 100.0
-        except (ValueError, TypeError, ZeroDivisionError):
-            return 0.0
-
-    def safe_get_nested(self, data, *keys, default=None):
-        """Safely navigate nested dictionary structure."""
-        result = data
-        for key in keys:
-            if isinstance(result, dict):
-                result = result.get(key)
-                if result is None:
-                    return default
-            else:
-                return default
-        return result if result is not None else default
-
     def update_all_rows(self):
-        """Iterates all tree rows and updates them with the latest data."""
-        if not self.instrument_map: 
+        """Update all rows using background thread."""
+        if not self.instrument_map or self.update_in_progress:
             return
-            
-        strike_col_index = self.tree['columns'].index('strike')
-
-        for item_id in self.tree.get_children():
-            try:
-                strike_str = self.tree.item(item_id)['values'][strike_col_index]
-                if strike_str not in self.chain_data: 
-                    continue
-
-                ce_key = self.chain_data[strike_str].get("CE")
-                pe_key = self.chain_data[strike_str].get("PE")
-
-                ce_latest = self.get_latest_data(ce_key)
-                pe_latest = self.get_latest_data(pe_key)
-                
-                # Navigate to marketFF using safe getter
-                ce_market_ff = self.safe_get_nested(ce_latest, 'feed', 'fullFeed', 'marketFF', default={})
-                pe_market_ff = self.safe_get_nested(pe_latest, 'feed', 'fullFeed', 'marketFF', default={})
-
-                # --- Extract Call data ---
-                call_ltpc = ce_market_ff.get('ltpc', {}) 
-                call_greeks = ce_market_ff.get('optionGreeks', {}) 
-                
-                call_ltp = call_ltpc.get('ltp', 0.0)
-                call_cp = call_ltpc.get('cp', 0.0)
-                call_oi = ce_market_ff.get('oi', 0.0)
-                call_iv = ce_market_ff.get('iv', 0.0)
-                call_delta = call_greeks.get('delta', 0.0)
-                call_gamma = call_greeks.get('gamma', 0.0)
-                call_vega = call_greeks.get('vega', 0.0)
-                call_theta = call_greeks.get('theta', 0.0)
-                call_chg_pct = self.calculate_change_pct(call_ltp, call_cp)
-
-                # --- Update Call Tree Values ---
-                self.tree.set(item_id, "call_ltp", f"{call_ltp:.2f}")
-                self.tree.set(item_id, "call_oi", f"{call_oi:.0f}" if isinstance(call_oi, (int, float)) else "N/A")
-                self.tree.set(item_id, "call_oi_chg_pct", f"{call_chg_pct:.1f}%")
-                self.tree.set(item_id, "call_iv", f"{call_iv:.4f}")
-                self.tree.set(item_id, "call_delta", f"{call_delta:.4f}")
-                self.tree.set(item_id, "call_gamma", f"{call_gamma:.4f}")
-                self.tree.set(item_id, "call_vega", f"{call_vega:.4f}")
-                self.tree.set(item_id, "call_theta", f"{call_theta:.4f}")
-
-                # --- Extract Put data ---
-                put_ltpc = pe_market_ff.get('ltpc', {}) 
-                put_greeks = pe_market_ff.get('optionGreeks', {}) 
-                
-                put_ltp = put_ltpc.get('ltp', 0.0)
-                put_cp = put_ltpc.get('cp', 0.0)
-                put_oi = pe_market_ff.get('oi', 0.0)
-                put_iv = pe_market_ff.get('iv', 0.0)
-                put_delta = put_greeks.get('delta', 0.0)
-                put_gamma = put_greeks.get('gamma', 0.0)
-                put_vega = put_greeks.get('vega', 0.0)
-                put_theta = put_greeks.get('theta', 0.0)
-                put_chg_pct = self.calculate_change_pct(put_ltp, put_cp)
-
-                # --- Update Put Tree Values ---
-                self.tree.set(item_id, "put_ltp", f"{put_ltp:.2f}")
-                self.tree.set(item_id, "put_oi", f"{put_oi:.0f}" if isinstance(put_oi, (int, float)) else "N/A")
-                self.tree.set(item_id, "put_oi_chg_pct", f"{put_chg_pct:.1f}%")
-                self.tree.set(item_id, "put_iv", f"{put_iv:.4f}")
-                self.tree.set(item_id, "put_delta", f"{put_delta:.4f}")
-                self.tree.set(item_id, "put_gamma", f"{put_gamma:.4f}")
-                self.tree.set(item_id, "put_vega", f"{put_vega:.4f}")
-                self.tree.set(item_id, "put_theta", f"{put_theta:.4f}")
-                
-            except Exception as e:
-                print(f"ERROR updating row {strike_str}: {e}")
-
-    def get_latest_data(self, instrument_key):
-        if not instrument_key: 
-            return {}
-        now = datetime.now()
         
-        # Check cache
-        if instrument_key in self.live_data_cache:
-            read_time, data = self.live_data_cache[instrument_key]
-            if (now - read_time).total_seconds() < CACHE_STALE_SECONDS: 
-                return data
+        self.update_in_progress = True
+        self.status_label.config(text="Updating...")
+        self.log_debug("Starting update_all_rows")
+        
+        threading.Thread(target=self._fetch_and_update, daemon=True).start()
+
+    def _fetch_and_update(self):
+        """Background thread to fetch data and schedule UI updates."""
+        items_to_update = []
+        self.latest_snapshot_date = None
+        snapshot_date_str = None
         
         try:
-            safe_key = instrument_key.replace("|", "_")
-            today = now.strftime('%Y-%m-%d')
-            filepath = os.path.join(DATA_DIR, safe_key, f"{today}.json")
+            start_date = self.start_date.get_date()
+            end_date = self.end_date.get_date()
             
-            if not os.path.exists(filepath): 
-                return {}
+            # We need to add time to the date to make a full timestamp for the query
+            start_timestamp = f"{start_date} 00:00:00"
+            end_timestamp = f"{end_date} 23:59:59" 
             
-            # Read last line
-            last_line = ""
-            with open(filepath, 'rb') as f:
-                try:  
-                    f.seek(-2, os.SEEK_END)
-                    while f.read(1) != b'\n':
-                        f.seek(-2, os.SEEK_CUR)
-                        if f.tell() == 0: 
-                            break
-                except IOError: 
-                    f.seek(0)
-                last_line = f.readline().decode('utf-8')
+            all_keys = tuple(self.instrument_map.keys())
+            if not all_keys:
+                self.log_debug("Instrument map is empty, skipping fetch.")
+                self.root.after_idle(lambda: self._apply_updates([], no_data_in_range=True))
+                return
+
+            # This single, fast query replaces ALL the file reading
+            # It finds the latest timestamp for EACH key within the date range
+            query = f"""
+                SELECT t.timestamp, t.instrument_key, t.ltp, t.cp, t.oi, t.iv, t.delta, t.gamma, t.vega, t.theta 
+                FROM ticks t
+                INNER JOIN (
+                    SELECT instrument_key, MAX(timestamp) AS max_ts
+                    FROM ticks
+                    WHERE instrument_key IN ({','.join(['?'] * len(all_keys))})
+                    AND timestamp BETWEEN ? AND ?
+                    GROUP BY instrument_key
+                ) tm ON t.instrument_key = tm.instrument_key AND t.timestamp = tm.max_ts
+            """
             
-            if not last_line: 
-                return {}
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
             
-            data = json.loads(last_line)
+            params = all_keys + (start_timestamp, end_timestamp)
+            cursor.execute(query, params)
+            latest_ticks = cursor.fetchall()
+            conn.close()
+
+            if not latest_ticks:
+                self.log_debug("No snapshot data found in range.")
+                self.root.after_idle(lambda: self._apply_updates([], no_data_in_range=True))
+                return
+
+            # Get the snapshot date from the first result for the status bar
+            snapshot_date_str = datetime.fromisoformat(latest_ticks[0][0]).strftime('%Y-%m-%d')
+            self.latest_snapshot_date = snapshot_date_str
+
+            # Create a dict for fast lookup
+            # {instrument_key: (ltp, cp, oi, iv, ...)}
+            tick_map = {row[1]: row[2:] for row in latest_ticks}
+
+            for key, (strike, opt_type, item_id) in self.instrument_map.items():
+                if key in tick_map:
+                    data = tick_map[key]
+                    ltp, cp, oi, iv, delta, gamma, vega, theta = data
+                    
+                    chg_pct = 0.0
+                    if cp and cp > 0:
+                        chg_pct = ((ltp - cp) / cp) * 100.0
+                    
+                    if opt_type == "CE":
+                        row_data = {
+                            "item_id": item_id,
+                            "call_ltp": f"{ltp:.2f}",
+                            "call_oi": f"{oi:,.0f}",
+                            "call_oi_chg_pct": f"{chg_pct:+.1f}%",
+                            "call_iv": f"{iv:.2f}",
+                            "call_delta": f"{delta:.4f}",
+                            "call_gamma": f"{gamma:.4f}",
+                            "call_vega": f"{vega:.4f}",
+                            "call_theta": f"{theta:.4f}"
+                        }
+                    else: # PE
+                        row_data = {
+                            "item_id": item_id,
+                            "put_ltp": f"{ltp:.2f}",
+                            "put_oi": f"{oi:,.0f}",
+                            "put_oi_chg_pct": f"{chg_pct:+.1f}%",
+                            "put_iv": f"{iv:.2f}",
+                            "put_delta": f"{delta:.4f}",
+                            "put_gamma": f"{gamma:.4f}",
+                            "put_vega": f"{vega:.4f}",
+                            "put_theta": f"{theta:.4f}"
+                        }
+                    items_to_update.append(row_data)
+
+            self.log_debug(f"Found {len(latest_ticks)} ticks. Rows to update: {len(items_to_update)}")
             
-            if "timestamp" not in data or "feed" not in data:
-                print(f"WARN: Bad JSON structure in {filepath}")
-                return {}
-            
-            # Cache the complete data structure
-            self.live_data_cache[instrument_key] = (now, data)
-            return data
-            
-        except json.JSONDecodeError as e:
-            print(f"JSON decode error for {instrument_key}: {e}")
-            return self.live_data_cache.get(instrument_key, (None, {}))[1]
         except Exception as e:
-            print(f"ERROR reading {instrument_key}: {e}")
-            return {}
+            print(f"Error in _fetch_and_update: {e}")
+        finally:
+            self.root.after_idle(lambda: self._apply_updates(items_to_update, snapshot_date_str=snapshot_date_str))
 
-    # --- Graphing Functionality ---
+    def _apply_updates(self, items_to_update, snapshot_date_str=None, no_data_in_range=False):
+        """Apply updates to tree on main thread."""
+        try:
+            # We must map by item_id since a single row (item_id) gets multiple updates
+            updates_by_item = {}
+            for row_data in items_to_update:
+                item_id = row_data.pop("item_id")
+                if item_id not in updates_by_item:
+                    updates_by_item[item_id] = {}
+                updates_by_item[item_id].update(row_data)
 
-    def show_context_menu(self, event):
-        item_id = self.tree.identify_row(event.y)
-        col_id = self.tree.identify_column(event.x)
-        if not item_id: 
-            return
-
-        col_name = self.tree.column(col_id, "id")
-        strike_col_index = self.tree['columns'].index('strike')
-        strike = self.tree.item(item_id)['values'][strike_col_index]
-        if strike not in self.chain_data: 
-            return
-        
-        instrument_key = None
-        data_key_path = None
-
-        if col_name.startswith("call_"):
-            instrument_key = self.chain_data[strike].get("CE")
-            if col_name == "call_ltp": 
-                data_key_path = ("ltpc", "ltp")
-            elif col_name == "call_oi": 
-                data_key_path = ("oi",)
-            elif col_name == "call_iv": 
-                data_key_path = ("iv",)
-            elif col_name == "call_delta": 
-                data_key_path = ("optionGreeks", "delta")
-            elif col_name == "call_gamma": 
-                data_key_path = ("optionGreeks", "gamma")
-            elif col_name == "call_vega": 
-                data_key_path = ("optionGreeks", "vega")
-            elif col_name == "call_theta": 
-                data_key_path = ("optionGreeks", "theta")
+            # Clear all old data first
+            for item_id in self.tree.get_children():
+                values = self.tree.item(item_id, 'values')
+                strike = values[self.tree['columns'].index('strike')]
+                new_values = [""] * len(self.tree['columns'])
+                new_values[self.tree['columns'].index('strike')] = strike
+                self.tree.item(item_id, values=new_values)
             
-        elif col_name.startswith("put_"):
-            instrument_key = self.chain_data[strike].get("PE")
-            if col_name == "put_ltp": 
-                data_key_path = ("ltpc", "ltp")
-            elif col_name == "put_oi": 
-                data_key_path = ("oi",)
-            elif col_name == "put_iv": 
-                data_key_path = ("iv",)
-            elif col_name == "put_delta": 
-                data_key_path = ("optionGreeks", "delta")
-            elif col_name == "put_gamma": 
-                data_key_path = ("optionGreeks", "gamma")
-            elif col_name == "put_vega": 
-                data_key_path = ("optionGreeks", "vega")
-            elif col_name == "put_theta": 
-                data_key_path = ("optionGreeks", "theta")
-
-        if not instrument_key or not data_key_path:
-            return
-
-        menu = tk.Menu(self.root, tearoff=0)
-        submenu = tk.Menu(menu, tearoff=0)
-        time_options = [1, 5, 15, 30, 60]
-        
-        for minutes in time_options:
-            submenu.add_command(
-                label=f"Last {minutes} Mins", 
-                command=lambda m=minutes, p=data_key_path: self.plot_graph(instrument_key, p, m)
-            )
-        submenu.add_separator()
-        submenu.add_command(
-            label="All Day", 
-            command=lambda p=data_key_path: self.plot_graph(instrument_key, p, 0)
-        )
-        
-        display_key = ".".join(data_key_path)
-        menu.add_cascade(label=f"Graph {display_key}", menu=submenu)
-        
-        try: 
-            menu.tk_popup(event.x_root, event.y_root)
-        finally: 
-            menu.grab_release()
+            # Apply all new updates
+            for item_id, updates in updates_by_item.items():
+                if self.tree.exists(item_id):
+                    for column, value in updates.items():
+                        self.tree.set(item_id, column, value)
+            
+            if no_data_in_range:
+                self.status_label.config(text="No data found in selected range.", foreground="red")
+            elif items_to_update:
+                status_msg = f"Updated {len(updates_by_item)} rows."
+                if snapshot_date_str:
+                    status_msg += f" (Displaying data for {snapshot_date_str})"
+                self.status_label.config(text=status_msg, foreground="green")
+            else:
+                status_msg = f"No data found"
+                if snapshot_date_str:
+                    status_msg += f" for date {snapshot_date_str}"
+                self.status_label.config(text=status_msg, foreground="red")
+        except Exception as e:
+            print(f"Error applying updates: {e}")
+            self.status_label.config(text="Update failed", foreground="red")
+        finally:
+            self.update_in_progress = False
+            self.root.after(3000, lambda: self.status_label.config(text="", foreground="gray"))
 
     def get_historical_data(self, instrument_key, data_key_path, minutes):
-        safe_key = instrument_key.replace("|", "_")
-        today = datetime.now().strftime('%Y-%m-%d')
-        filepath = os.path.join(DATA_DIR, safe_key, f"{today}.json")
+        """Get historical data points for graphing."""
+        start_date = self.start_date.get_date()
+        end_date = self.end_date.get_date()
         
-        # Debug: Check if file exists
-        if not os.path.exists(filepath):
-            # Try to find the directory to see what files are there
-            dir_path = os.path.join(DATA_DIR, safe_key)
-            if os.path.exists(dir_path):
-                available_files = os.listdir(dir_path)
-                messagebox.showwarning(
-                    "No Data", 
-                    f"File not found:\n{filepath}\n\n"
-                    f"Available files in directory:\n{', '.join(available_files) if available_files else 'None'}"
-                )
+        if start_date > end_date:
+            messagebox.showerror("Invalid Date Range", f"Start date ({start_date}) must be before or equal to end date ({end_date})")
+            return [], "Error"
+
+        # --- FIX: Smarter Time Range Logic ---
+        
+        # Default: Full day range
+        start_ts = f"{start_date} 00:00:00"
+        end_ts = f"{end_date} 23:59:59"
+
+        if minutes > 0:
+            # We are filtering for the "last X minutes"
+            
+            # Base the 'end' time on the current time if it's today
+            if end_date == datetime.now().date():
+                end_datetime = datetime.now()
             else:
-                messagebox.showwarning(
-                    "No Data", 
-                    f"Directory not found:\n{dir_path}\n\n"
-                    f"Make sure data is being collected for instrument:\n{instrument_key}"
-                )
-            return []
+                # *** FIX ***
+                # For historical, set the 'end' time to the end of the market day
+                end_datetime = datetime.combine(end_date, MARKET_CLOSE_TIME)
+                # *** END FIX ***
+
+            # Calculate cutoff time X minutes *before* this end_datetime
+            cutoff_time = end_datetime - timedelta(minutes=minutes)
+            
+            # The query range is now from the cutoff to the end time
+            start_ts = cutoff_time.isoformat(timespec='microseconds')
+            end_ts = end_datetime.isoformat(timespec='microseconds')
+        # --- END FIX ---
+
+        # Map the old list-based path to a new column name
+        column_map = {
+            tuple(["fullFeed", "marketFF", "ltpc", "ltp"]): "ltp",
+            tuple(["Chg %"]): "chg_pct", # Special case
+            tuple(["fullFeed", "marketFF", "oi"]): "oi",
+            tuple(["fullFeed", "marketFF", "iv"]): "iv",
+            tuple(["fullFeed", "marketFF", "optionGreeks", "delta"]): "delta",
+            tuple(["fullFeed", "marketFF", "optionGreeks", "gamma"]): "gamma",
+            tuple(["fullFeed", "marketFF", "optionGreeks", "vega"]): "vega",
+            tuple(["fullFeed", "marketFF", "optionGreeks", "theta"]): "theta",
+        }
+        
+        display_key = "Chg %" if data_key_path == ["Chg %"] else ".".join(data_key_path)
+        is_chg_pct = (data_key_path == ["Chg %"])
+        
+        if is_chg_pct:
+            query_cols = "timestamp, ltp, cp" # Need ltp and cp to calculate
+        else:
+            db_col = column_map.get(tuple(data_key_path))
+            if not db_col:
+                messagebox.showerror("Error", f"Unknown graph key: {display_key}")
+                return [], "Error"
+            query_cols = f"timestamp, {db_col}"
+
+        query = f"""
+            SELECT {query_cols} FROM ticks
+            WHERE instrument_key = ?
+            AND timestamp BETWEEN ? AND ?
+            ORDER BY timestamp
+        """
         
         data_points = []
-        now = datetime.now()
-        time_filter = (now - timedelta(minutes=minutes)) if minutes > 0 else datetime.min
-        
-        total_lines = 0
-        valid_lines = 0
-        lines_in_range = 0
-        
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                for line in f:
-                    total_lines += 1
-                    try:
-                        line_data = json.loads(line)
-                        ts_str = line_data.get("timestamp")
-                        market_ff = self.safe_get_nested(
-                            line_data, 'feed', 'fullFeed', 'marketFF', default=None
-                        )
-                        
-                        if not ts_str or not market_ff: 
-                            continue
-                        
-                        valid_lines += 1
-                        ts = datetime.fromisoformat(ts_str)
-                        
-                        if ts >= time_filter:
-                            lines_in_range += 1
-                            # Navigate to the specific value
-                            val = self.safe_get_nested(market_ff, *data_key_path, default=None)
-                            
-                            if val is not None:
-                                try: 
-                                    data_points.append((ts, float(val)))
-                                except (ValueError, TypeError): 
-                                    pass
-                                    
-                    except (json.JSONDecodeError, TypeError, ValueError) as e: 
-                        continue
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute(query, (instrument_key, start_ts, end_ts))
             
-            # If no data points found, show detailed debug info
-            if not data_points:
-                display_key = ".".join(data_key_path)
-                time_str = f"last {minutes} minutes" if minutes > 0 else "all day"
-                messagebox.showinfo(
-                    "No Data", 
-                    f"No valid data points found for:\n"
-                    f"Instrument: {instrument_key}\n"
-                    f"Field: {display_key}\n"
-                    f"Time range: {time_str}\n\n"
-                    f"Debug info:\n"
-                    f"- Total lines in file: {total_lines}\n"
-                    f"- Valid JSON lines: {valid_lines}\n"
-                    f"- Lines in time range: {lines_in_range}\n"
-                    f"- Data points extracted: {len(data_points)}"
-                )
+            for row in cursor.fetchall():
+                ts = datetime.fromisoformat(row[0])
+                if is_chg_pct:
+                    ltp = row[1] or 0.0
+                    cp = row[2] or 0.0
+                    val = ((ltp - cp) / cp) * 100.0 if cp and cp > 0 else 0.0
+                else:
+                    val = row[1] or 0.0 # Default to 0 if None
+                data_points.append((ts, float(val)))
                 
         except Exception as e:
-            messagebox.showerror("Read Error", f"Could not read {filepath}:\n{e}")
-            return []
-            
-        return data_points
+            print(f"Error reading history from DB: {e}")
+            messagebox.showerror("Database Error", f"Could not read graph data: {e}")
+        finally:
+            if conn:
+                conn.close()
 
+        if not data_points:
+            time_str = f"range {start_date} to {end_date}"
+            if minutes > 0:
+                time_str = f"last {minutes} minutes"
+            messagebox.showinfo(
+                "No Data",
+                f"No valid data points found for:\n"
+                f"Instrument: {instrument_key}\n"
+                f"Field: {display_key}\n"
+                f"Time: {time_str}"
+            )
+
+        return data_points, display_key
+    
     def plot_graph(self, instrument_key, data_key_path, minutes):
-        display_key = ".".join(data_key_path)
-        historical_data = self.get_historical_data(instrument_key, data_key_path, minutes)
+        """Plot graph in separate window."""
+        
+        display_key = "Chg %" if data_key_path == ["Chg %"] else ".".join(data_key_path)
+
+        original_text = self.refresh_button.cget("text")
+        self.refresh_button.config(text="Loading graph...", state="disabled")
+        self.root.update()
+        
+        def load_and_plot(original_text_arg):
+            try:
+                historical_data, display_key = self.get_historical_data(instrument_key, data_key_path, minutes)
+                self.root.after_idle(lambda: self._show_plot(instrument_key, display_key, 
+                                                             historical_data, minutes, original_text_arg))
+            except Exception as e:
+                print(f"Error loading graph data: {e}")
+                self.root.after_idle(lambda: self.refresh_button.config(text=original_text_arg, state="normal"))
+        
+        threading.Thread(target=lambda: load_and_plot(original_text), daemon=True).start()
+
+    def _show_plot(self, instrument_key, display_key, historical_data, minutes, original_btn_text):
+        """Show plot on main thread."""
+        self.refresh_button.config(text=original_btn_text, state="normal")
         
         if not historical_data:
-            # Error message is already shown in get_historical_data
             return
         
         try: 
@@ -502,31 +616,159 @@ class OptionChainDashboard:
             return
         
         graph_window = tk.Toplevel(self.root)
-        time_str = f"Last {minutes} Mins" if minutes > 0 else "All Day"
+        time_str = f"Last {minutes} Mins" if minutes > 0 else f"Date Range"
         graph_window.title(f"Graph: {instrument_key} - {display_key} ({time_str})")
-        graph_window.geometry("800x600")
+        graph_window.geometry("900x650")
         
-        fig = Figure(figsize=(7, 5), dpi=100)
+        fig = Figure(figsize=(8, 5.5), dpi=100)
         ax = fig.add_subplot(111)
-        ax.plot(timestamps, values, label=display_key, linewidth=2)
-        ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+        ax.plot(timestamps, values, label=display_key, linewidth=2, color='#2E86AB')
+        
+        # --- FIX: New Date/Time Formatting ---
+        if (timestamps[-1] - timestamps[0]).days > 0:
+            # Format for multi-day: 31 Oct 2025 03:00PM
+            date_format = DateFormatter('%d %b %Y %I:%M%p')
+        else:
+            # Format for single-day: 03:00:15 PM
+            date_format = DateFormatter('%I:%M:%S %p')
+        
+        ax.xaxis.set_major_formatter(date_format)
+        # --- END FIX ---
+            
         ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=10, prune='both'))
         fig.autofmt_xdate()
-        ax.set_title(f"{instrument_key} - {display_key}")
-        ax.set_ylabel(display_key)
-        ax.set_xlabel("Time")
+        ax.set_title(f"{instrument_key} - {display_key}", fontsize=12, fontweight='bold')
+        ax.set_ylabel(display_key, fontsize=10)
+        ax.set_xlabel("Time", fontsize=10)
         ax.grid(True, linestyle='--', alpha=0.6)
-        ax.legend()
+        ax.legend(loc='best')
         fig.tight_layout()
         
         canvas = FigureCanvasTkAgg(fig, master=graph_window)
         canvas.draw()
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        # --- ADD INTERACTIVE TOOLBAR ---
+        toolbarFrame = ttk.Frame(master=graph_window)
+        toolbarFrame.pack(side=tk.BOTTOM, fill=tk.X)
+        toolbar = NavigationToolbar2Tk(canvas, toolbarFrame)
+        toolbar.update()
+        # --- END ---
+
+    def prompt_for_custom_time(self, instrument_key, data_key_path):
+        """Ask user for custom minutes."""
+        minutes = simpledialog.askinteger(
+            "Custom Time", 
+            "Enter time in minutes:",
+            parent=self.root,
+            minvalue=1,
+            maxvalue=10080 # 7 days
+        )
+        if minutes:
+            self.plot_graph(instrument_key, data_key_path, minutes)
+
+    def show_context_menu(self, event):
+        """Show context menu for graphing options on right-click."""
+        popup = None
+        try:
+            item_id = self.tree.identify_row(event.y)
+            if not item_id: return
+
+            values = self.tree.item(item_id)['values']
+            if not values: return
+                
+            strike_str = str(values[self.tree['columns'].index('strike')])
+            if strike_str not in self.chain_data: return
+
+            popup = tk.Menu(self.root, tearoff=0)
+            
+            # These are the *display labels* in the right-click menu
+            # And the old data_key_paths that get_historical_data will translate
+            graph_options = [
+                ("LTP", ["fullFeed", "marketFF", "ltpc", "ltp"]),
+                ("Chg %", ["Chg %"]),
+                ("OI", ["fullFeed", "marketFF", "oi"]),
+                ("IV", ["fullFeed", "marketFF", "iv"]),
+                ("Delta", ["fullFeed", "marketFF", "optionGreeks", "delta"]),
+                ("Gamma", ["fullFeed", "marketFF", "optionGreeks", "gamma"]),
+                ("Vega", ["fullFeed", "marketFF", "optionGreeks", "vega"]),
+                ("Theta", ["fullFeed", "marketFF", "optionGreeks", "theta"])
+            ]
+            
+            # Add Call options
+            if "CE" in self.chain_data[strike_str]:
+                ce_key = self.chain_data[strike_str]["CE"]
+                call_menu = tk.Menu(popup, tearoff=0)
+                popup.add_cascade(label="Call Graphs", menu=call_menu)
+                
+                for minutes in [5, 15, 30, 60, 0]:
+                    time_str = f"Last {minutes} mins" if minutes > 0 else "Full Range"
+                    for label, data_key_path in graph_options:
+                        call_menu.add_command(
+                            label=f"{label} ({time_str})",
+                            command=lambda k=ce_key, path=data_key_path, m=minutes: 
+                                self.plot_graph(k, path, m)
+                        )
+                    if minutes != 0: call_menu.add_separator()
+                
+                call_menu.add_separator()
+                custom_submenu = tk.Menu(call_menu, tearoff=0)
+                call_menu.add_cascade(label="Custom...", menu=custom_submenu)
+                for label, data_key_path in graph_options:
+                    custom_submenu.add_command(
+                        label=f"{label}",
+                        command=lambda k=ce_key, path=data_key_path:
+                            self.prompt_for_custom_time(k, path)
+                    )
+
+            # Add Put options
+            if "PE" in self.chain_data[strike_str]:
+                pe_key = self.chain_data[strike_str]["PE"]
+                put_menu = tk.Menu(popup, tearoff=0)
+                popup.add_cascade(label="Put Graphs", menu=put_menu)
+                
+                for minutes in [5, 15, 30, 60, 0]:
+                    time_str = f"Last {minutes} mins" if minutes > 0 else "Full Range"
+                    for label, data_key_path in graph_options:
+                        put_menu.add_command(
+                            label=f"{label} ({time_str})",
+                            command=lambda k=pe_key, path=data_key_path, m=minutes: 
+                                self.plot_graph(k, path, m)
+                        )
+                    if minutes != 0: put_menu.add_separator()
+
+                put_menu.add_separator()
+                custom_submenu_put = tk.Menu(put_menu, tearoff=0)
+                put_menu.add_cascade(label="Custom...", menu=custom_submenu_put)
+                for label, data_key_path in graph_options:
+                    custom_submenu_put.add_command(
+                        label=f"{label}",
+                        command=lambda k=pe_key, path=data_key_path:
+                            self.prompt_for_custom_time(k, path)
+                    )
+
+            popup.tk_popup(event.x_root, event.y_root)
+            
+        except Exception as e:
+            print(f"Error showing context menu: {e}")
+        finally:
+            if popup:
+                try:
+                    popup.grab_release()
+                except:
+                    pass
+
 # --- Main execution ---
 if __name__ == "__main__":
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(RESOURCES_DIR, exist_ok=True)
-    root = tk.Tk()
-    app = OptionChainDashboard(root)
-    root.mainloop()
+    if not os.path.exists(DB_FILE):
+        messagebox.showerror("Database Not Found", 
+            f"Error: Database file '{DB_FILE}' not found.\n\n"
+            "Please run 'create_db.py' one time to create the database file before running this dashboard."
+        )
+    else:
+        if not os.path.exists(RESOURCES_DIR):
+             os.makedirs(RESOURCES_DIR)
+        
+        root = tk.Tk()
+        app = OptionChainDashboard(root)
+        root.mainloop()
