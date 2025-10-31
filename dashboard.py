@@ -580,7 +580,7 @@ class OptionChainDashboard:
                 f"Time: {time_str}"
             )
 
-        return data_points, display_key
+        return data_points, display_key 
     
     def plot_graph(self, instrument_key, data_key_path, minutes):
         """Plot graph in separate window."""
