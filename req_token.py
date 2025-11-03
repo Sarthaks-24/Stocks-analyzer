@@ -2,8 +2,11 @@ import os
 import requests
 from dotenv import load_dotenv
 
+
+load_dotenv()
 # Configuration
-NOTIFIER_ENDPOINT = "https://upstoxendpoint-faeuis-projects.vercel.app/api/notifier"
+NOTIFIER_ENDPOINT = os.getenv("ENDPOINT")
+
 ENV_FILE = ".env"
 
 def fetch_token_from_notifier():
