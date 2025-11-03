@@ -13,7 +13,7 @@ def fetch_token_from_notifier():
     # No headers needed now
     try:
         response = requests.get(NOTIFIER_ENDPOINT, timeout=10)
-        print(f"📡 Response status: {response.status_code}")
+        print(f" Response status: {response.status_code}")
 
         if response.status_code == 200:
             data = response.json()
