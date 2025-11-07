@@ -1,7 +1,7 @@
 .env
 data
 cache
-notifier/nodemodules/
+notifier/nodemodules
 .venv
 resources
 __pycache__
