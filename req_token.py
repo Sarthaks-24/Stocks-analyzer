@@ -13,7 +13,7 @@ def fetch_token_from_notifier():
     """Fetch access token from the Vercel notifier endpoint."""
     print("Fetching access token from notifier...")
 
-    # No headers needed now
+    
     try:
         response = requests.get(NOTIFIER_ENDPOINT, timeout=10)
         print(f" Response status: {response.status_code}")
