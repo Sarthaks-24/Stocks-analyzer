@@ -37,7 +37,6 @@ logging.basicConfig(
 log = logging.getLogger('manager')
 
 
-# --- Functions to Run Your Scripts ---
 
 def run_a_token():
     """Runs a_token_req.py and updates global state on success."""
@@ -47,8 +46,8 @@ def run_a_token():
         result = subprocess.run(
             [PYTHON_EXECUTABLE, "a_token_req.py"],
             cwd=BASE_DIR, capture_output=True, text=True, check=True,
-            encoding='utf-8', # Fix for unicode (emoji) errors
-            env=os.environ      # <-- THE FIX: Inherit environment variables
+            encoding='utf-8', 
+            env=os.environ      
         )
         log.info(f"'a_token_req.py' succeeded:\n{result.stdout}")
         last_run_a_token = datetime.datetime.now(INDIAN_TIMEZONE).date()
@@ -57,7 +56,7 @@ def run_a_token():
     except Exception as e:
         log.error(f"Error running 'a_token_req.py': {e}")
 
-# In run_all.py
+
 
 def run_req_token():
     """Runs req_token.py and updates global state on success."""
@@ -136,7 +135,7 @@ def stop_market_scripts():
         finally:
             fetch_process = None
     else:
-        fetch_process = None # Ensure it's marked as None if process is dead
+        fetch_process = None 
 
     if dashboard_process and dashboard_process.poll() is None:
         log.info(f"JOB: Stopping 'dashboard.py' (PID: {dashboard_process.pid})...")
@@ -155,7 +154,7 @@ def stop_market_scripts():
         dashboard_process = None
 
 
-# --- The Main Watchdog Function ---
+
 
 def watchdog_check():
     """
@@ -165,7 +164,7 @@ def watchdog_check():
     global last_run_a_token, last_run_req_token
     
     try:
-        # Get current date and time in India
+        
         now = datetime.datetime.now(INDIAN_TIMEZONE)
         today = now.date()
         current_time = now.time()
@@ -173,7 +172,7 @@ def watchdog_check():
 
         log.info(f"--- Watchdog Check --- Today: {today}, Time: {current_time}, Day: {day_of_week}")
 
-        # --- Rule 1: Check for Weekends ---
+       
         if day_of_week >= 5: # 5=Saturday, 6=Sunday
             log.info("Watchdog: Weekend. Ensuring market scripts are stopped.")
             stop_market_scripts()
@@ -181,7 +180,7 @@ def watchdog_check():
             last_run_req_token = None
             return
 
-        # --- Rule 2: Check `a_token_req.py` ---
+
         if current_time >= datetime.time(5, 0) and last_run_a_token != today:
             log.info("Watchdog: 'a_token' needs to run.")
             run_a_token()

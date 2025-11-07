@@ -1,20 +1,18 @@
-# fetch_data.py (Resilient Edition)
 import os, asyncio, json, ssl, websockets, requests
 from datetime import datetime
 from google.protobuf.json_format import MessageToDict
 from dotenv import load_dotenv
-import uuid # For unique GUIDs
+import uuid 
 import sqlite3
-import time # <-- FIX: Import time for sleeping
+import time 
 
 load_dotenv()
 
 import MarketDataFeedV3_pb2 as pb
-import create_db # Import the database creation script
+import create_db 
 
-# --- Configuration ---
 DB_FILE = 'resources/live_data.db'
-RECONNECT_DELAY_SECONDS = 10 # <-- FIX: Wait 10 seconds before retrying
+RECONNECT_DELAY_SECONDS = 10 
 
 
 def get_market_data_feed_authorize_v3():
@@ -26,14 +24,11 @@ def get_market_data_feed_authorize_v3():
     }
     url = 'https://api.upstox.com/v3/feed/market-data-feed/authorize'
     try:
-        # NOTE: If you are behind a proxy, you MUST add the 'proxies' argument
-        # my_proxies = { "https": "http://your-proxy.com:port" }
-        # api_response = requests.get(url=url, headers=headers, proxies=my_proxies)
         
         api_response = requests.get(url=url, headers=headers)
         
         print(f"DEBUG: Authorization response status: {api_response.status_code}")
-        api_response.raise_for_status() # <-- FIX: Raise error on bad status (like 401)
+        api_response.raise_for_status() 
         return api_response.json()
     except requests.exceptions.HTTPError as he:
         print(f"ERROR: HTTP Error during authorization: {he}")
@@ -44,16 +39,11 @@ def get_market_data_feed_authorize_v3():
 
 
 def decode_protobuf(buffer):
-    """Decode protobuf message."""
     feed_response = pb.FeedResponse()
     feed_response.ParseFromString(buffer)
     return feed_response
 
-# --- Helper function for safely getting nested dictionary keys ---
 def safe_get_nested(data, *keys, default=None):
-    """
-    Safely navigate nested dictionary structure.
-    """
     result = data
     for key in keys:
         if isinstance(result, dict):
@@ -63,10 +53,7 @@ def safe_get_nested(data, *keys, default=None):
     return result if result is not None else default
 
 def _blocking_db_write(tick_data):
-    """
-    This function runs in a separate thread to avoid
-    blocking the asyncio event loop.
-    """
+
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10) 
         conn.execute(
@@ -81,10 +68,7 @@ def _blocking_db_write(tick_data):
         print(f"Error in _blocking_db_write: {e}")
 
 async def save_tick_to_db(timestamp, instrument_key, feed_dict):
-    """
-    Parses a *dictionary* (from MessageToDict) and inserts it 
-    into the SQLite database.
-    """
+
     try:
         market_ff = safe_get_nested(feed_dict, 'fullFeed', 'marketFF', default={})
         ltpc = market_ff.get('ltpc', {}) 
@@ -111,14 +95,11 @@ async def save_tick_to_db(timestamp, instrument_key, feed_dict):
 
 
 async def fetch_market_data():
-    """Fetch market data using WebSocket and print it."""
 
-    # Create default SSL context
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
 
-    # Get market data feed authorization
     response = get_market_data_feed_authorize_v3()
     
     # --- FIX: Improved authorization check ---
@@ -144,10 +125,10 @@ async def fetch_market_data():
                     instruments = [line.strip() for line in f if line.strip()]
                 if not instruments:
                     print("ERROR: instruments.txt is empty. Nothing to subscribe to.")
-                    return # This is a fatal error, so we return
+                    return 
             except Exception as e:
                 print(f"ERROR: Could not read 'resources/instruments.txt': {e}")
-                return # This is also fatal
+                return 
 
             data = {
                 "guid": str(uuid.uuid4()),
@@ -163,7 +144,7 @@ async def fetch_market_data():
             print(f"DEBUG: Subscription sent for {len(instruments)} instruments.")
             print("DEBUG: Now waiting for data from server...")
 
-            # This is the inner loop for receiving data
+            
             while True:
                 message = await websocket.recv()
                 decoded_data = decode_protobuf(message)
@@ -187,12 +168,10 @@ async def fetch_market_data():
                 elif data_dict.get("type") == "market_info":
                     print(f"Market Status Update: {data_dict.get('marketInfo', {}).get('segmentStatus')}")
     
-    # --- FIX: These exceptions will now be caught by the *outer* loop ---
     except websockets.exceptions.ConnectionClosed as e:
         print(f"DEBUG: WebSocket connection closed: {e}. Reconnecting...")
     except Exception as e:
         print(f"ERROR: An error occurred in fetch_market_data: {e}. Reconnecting...")
-        # Raise the exception again to be caught by the outer loop
         raise e
 
 
@@ -202,17 +181,13 @@ if __name__ == "__main__":
     
     print("Starting market data feed...")
     
-    # --- THIS IS THE NEW OUTER RETRY LOOP ---
     while True:
         try:
-            # Run the main async function
             asyncio.run(fetch_market_data())
             
-            # If asyncio.run finishes, it means a disconnect happened.
             print(f"INFO: Main loop exited. Waiting {RECONNECT_DELAY_SECONDS}s to reconnect...")
             time.sleep(RECONNECT_DELAY_SECONDS)
             
         except Exception as e:
-            # This catches any unhandled error (like Auth fail)
             print(f"FATAL: Unhandled error in main loop: {e}. Retrying in {RECONNECT_DELAY_SECONDS}s...")
             time.sleep(RECONNECT_DELAY_SECONDS)
