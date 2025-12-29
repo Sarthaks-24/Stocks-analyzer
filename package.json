@@ -1,0 +1,15 @@
+{
+    "name": "stock-tracker-root",
+    "version": "1.0.0",
+    "private": true,
+    "scripts": {
+        "db:up": "docker-compose up -d",
+        "server": "cd server && venv\\Scripts\\python -m uvicorn main:app --reload",
+        "client": "npm run dev --prefix client",
+        "ingest:real": "cd server && venv\\Scripts\\python ingestor.py",
+        "dev": "concurrently \"npm:client\" \"npm:server\""
+    },
+    "devDependencies": {
+        "concurrently": "^9.1.0"
+    }
+}
