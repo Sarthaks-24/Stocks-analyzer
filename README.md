@@ -69,7 +69,7 @@ The application culminates in an **interactive Option Chain Dashboard (GUI)** th
 │   └── manager.log   
 ├── notifier-endpoint/ 
 │   ├── package.json 
-│   ├── package-lokc.json
+│   ├── package-lock.json
 │   └──api/
 │       └── notifier.js      # Vercel deployable file for the storing of access token as an endpoint
 │
@@ -204,5 +204,5 @@ CTRL + C
 ## 👤 Author 
 
 **Sarthak Suri**  
-Student developer passionate about combining **Software Engineering**.  
+Student developer passionate about **Software Engineering**.  
 
