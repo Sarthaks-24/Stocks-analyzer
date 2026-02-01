@@ -257,8 +257,8 @@ class OptionChainDashboard:
         if self.current_expiry_date:
             # Set max date for calendars to the expiry date
             self.start_date.config(maxdate=self.current_expiry_date)
-            self.end_date.config(maxdate=self.current_expiry_date)
-            
+            self.end_date.config(maxdate=self.current_expiry_date + timedelta(days=1))
+                        
             # Set end_date to expiry or today, whichever is earlier
             default_end_date = min(self.current_expiry_date, today)
             self.end_date.set_date(default_end_date)
